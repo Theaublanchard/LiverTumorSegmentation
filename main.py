@@ -14,7 +14,7 @@ import pandas as pd
 import unet
 from augmentations import ct_transform, aug_transform
 from datasets import LiverDataset
-from utils import MetricLogger
+from utils import MetricLogger, t_vMF_dice_loss, dice_score
 
 
 torch.manual_seed(1312)
@@ -55,8 +55,8 @@ def get_arguments():
                         help='Weight decay')
     parser.add_argument("--momentum", type=float, default=0.9,
                         help='Momentum')
-    parser.add_argument("--weight-reg", type=float, default=None,
-                        help="Gradient regularization weight")
+    parser.add_argument("--lmbda", type=float, default=128.,
+                        help="Upper bound for the class weights in the t-vMF loss.")
 
     # Running
     parser.add_argument("--num-workers", type=int, default=0)
@@ -100,7 +100,8 @@ def main(args):
     )
 
     channels_list = [int(x) for x in args.channels_list.split(",")]
-    model = unet.UNet(args.n_channels, args.num_classes, channels_list,args.post_process).cuda(gpu)
+    model = unet.UNet(args.n_channels, args.num_classes, channels_list).to(gpu)
+    # model = torch.compile(model)
     
     optimizer = optim.SGD(model.parameters(),
             lr=args.base_lr, 
@@ -108,15 +109,9 @@ def main(args):
             weight_decay=args.wd)
     
 
-    ########################################
-    # MODIFY THE LOSS FUNCTION HERE
-    if args.weight_reg is None:
-        criterion = nn.L1Loss()
-    else:
-        criterion = lambda x, y: nn.L1Loss()(x, y) + Gradient_loss(args.weight_reg,device = gpu)(x, y)
-
-    criterion = nn.CrossEntropyLoss()
-    ########################################
+    # Loss function
+    criterion = t_vMF_dice_loss
+    k_tensor = torch.zeros(args.num_classes).to(gpu)
 
 
     if (args.exp_dir / "model.pth").is_file():
@@ -139,8 +134,8 @@ def main(args):
     for epoch in range(start_epoch, args.epochs):
 
         # Training and validation loops
-        epoch_loss_train, lr = train_one_epoch(model, epoch,optimizer, criterion, loader_train,gpu)
-        epoch_loss_val = validate_one_epoch(model, epoch, criterion, loader_val, gpu)
+        epoch_loss_train, lr = train_one_epoch(model, epoch,optimizer, criterion, loader_train,gpu,k_tensor)
+        epoch_loss_val = validate_one_epoch(model, epoch, criterion, loader_val, gpu,k_tensor,args.lmbda)
 
 
         # Save checkpoint
@@ -189,51 +184,65 @@ def adjust_learning_rate(args, optimizer, loader, step,gpu):
     return lr
 
 
-def train_one_epoch(model, epoch,optimizer, criterion, loader, gpu ):
+def train_one_epoch(model, epoch,optimizer, criterion, loader, gpu, k_tensor):
     model.train()
 
     loss_epoch = 0
+    dsc_epoch = torch.zeros(args.num_classes)
     batches_seen = 0
 
     pbar = tqdm(enumerate(loader, start=epoch * len(loader)), total=len(loader), desc=f"Epoch {epoch}")
     
     for step,(ct_scan, seg_scan, _) in pbar:
-        x = ct_scan.cuda(gpu, non_blocking=True).float()
-        y = seg_scan.cuda(gpu, non_blocking=True).float()
+        x = ct_scan.to(gpu, non_blocking=True).float()
+        y = seg_scan.to(gpu, non_blocking=True).float()
 
         lr = adjust_learning_rate(args, optimizer, loader, step,gpu)
         
         optimizer.zero_grad()
 
         output = model(x)
-        loss = criterion(output, y)
+        loss = criterion(output, y,k_tensor)
         loss.backward()
         optimizer.step()
 
+        # Logging
+        output_argmax = output.argmax(dim=1)
+        pred_seg = torch.nn.functional.one_hot(output_argmax, args.num_classes).permute(0, 3, 1, 2)
+        dsc = dice_score(pred_seg, y)
+        dsc_epoch += dsc
         loss_epoch += loss.item()
         batches_seen += 1
 
-        pbar.set_postfix_str(f"Loss_batch {loss.item():.4f} - Loss_train_epoch {loss_epoch / batches_seen:.4f} - LR {lr:.4f}")
+        pbar.set_postfix_str(f"Loss_batch {loss.item():.4f} - Loss_train_epoch {loss_epoch / batches_seen:.4f} - DSC_batch {dsc} - DSC_train_epoch {dsc_epoch / batches_seen}")
 
     return loss_epoch/batches_seen, lr
 
 
-def validate_one_epoch(model, epoch, criterion, loader, gpu):
+def validate_one_epoch(model, epoch, criterion, loader, gpu, k_tensor, lmbda):
     model.eval()
 
     loss_epoch = 0
+    dsc_epoch = 0
     batches_seen = 0
 
     pbar = tqdm(enumerate(loader, start=epoch * len(loader)), total=len(loader), desc=f"Epoch {epoch}")
     with torch.no_grad():
         for step,(ct_scan, seg_scan,_) in pbar:
-            x = ct_scan.cuda(gpu, non_blocking=True).float()
-            y = seg_scan.cuda(gpu, non_blocking=True).float()
+            x = ct_scan.to(gpu, non_blocking=True).float()
+            y = seg_scan.to(gpu, non_blocking=True).float()
 
             output = model(x)
-            loss = criterion(output, y)
+            loss = criterion(output, y, k_tensor).item()
 
-            loss_epoch += loss.item()
+            output_argmax = output.argmax(dim=1)
+            pred_seg = torch.nn.functional.one_hot(output_argmax, args.num_classes).permute(0, 3, 1, 2)
+            dsc = dice_score(pred_seg, y).item()
+
+            k_tensor = (lmbda * dsc).to(gpu)
+
+            loss_epoch += loss
+            dsc_epoch += dsc
             batches_seen += 1
 
             pbar.set_postfix_str(f"Loss {loss.item():.4f} - Loss_val_epoch {loss_epoch / batches_seen:.4f}")

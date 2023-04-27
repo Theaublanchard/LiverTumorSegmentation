@@ -53,6 +53,6 @@ class LiverDataset(Dataset):
                     seg_scan = aug(seg_scan)
                 ct_scan = aug(ct_scan)
         # One hot encoding of the segmentation mask
-        seg_scan = one_hot(seg_scan.long(), num_classes=3).float()
+        seg_scan = one_hot(seg_scan.long(), num_classes=3).squeeze(0).float().permute(2,0,1)
 
         return ct_scan, seg_scan, (row['patient_id'], row['slice_id'])
